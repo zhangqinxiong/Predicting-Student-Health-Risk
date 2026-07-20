@@ -15,10 +15,11 @@ from lightgbm import LGBMClassifier, early_stopping as lgb_early_stopping, log_e
 import warnings
 warnings.filterwarnings('ignore')
 
+from category_encoders import TargetEncoder
+
 RANDOM_STATE = 42
 N_FOLDS = 5
 N_DIRICHLET = 2000
-SMOOTH_M = 10
 
 train = pd.read_csv('input/train.csv')
 test = pd.read_csv('input/test.csv')
@@ -44,12 +45,16 @@ for df in [train, test]:
     for col in cat_features:
         df[col] = df[col].fillna('missing')
 
-preprocessor = ColumnTransformer(transformers=[
-    ('num', 'passthrough', numeric_features)
-])
+for df in [train, test]:
+    for col in numeric_features:
+        df[col] = df[col].fillna(df[col].median())
+    for col in cat_features:
+        df[col] = df[col].fillna('missing')
 
-X_base = preprocessor.fit_transform(train)
-X_test_base = preprocessor.transform(test)
+cat_features_idx = list(range(7, 13))
+all_features = numeric_features + cat_features
+X_base = train[all_features].copy()
+X_test_base = test[all_features].copy()
 
 skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
@@ -64,39 +69,6 @@ test_lgb = np.zeros((len(test), 3))
 catb_scores = []
 xgb_scores = []
 lgb_scores = []
-catb_models = []
-xgb_models = []
-lgb_models = []
-
-global_prior = np.bincount(target_encoded, minlength=n_classes) / len(target_encoded)
-
-def target_encode_fold(train_raw, y_fold, val_raw, test_raw):
-    """Per-fold smoothed target encoding for multiclass."""
-    prior = np.bincount(y_fold, minlength=n_classes) / len(y_fold)
-    categories, inv = np.unique(train_raw, return_inverse=True)
-    n_cats = len(categories)
-    cat_probas = np.zeros((n_cats, n_classes))
-    cat_counts = np.zeros(n_cats)
-    for i in range(n_cats):
-        mask = inv == i
-        counts = np.bincount(y_fold[mask], minlength=n_classes)
-        total = counts.sum()
-        cat_counts[i] = total
-        cat_probas[i] = (counts + SMOOTH_M * prior) / (total + SMOOTH_M)
-    proba_map = dict(zip(categories, cat_probas))
-    count_map = dict(zip(categories, cat_counts))
-    def map_values(values):
-        probas = np.array([proba_map.get(v, prior) for v in values])
-        counts = np.array([count_map.get(v, 0.0) for v in values])
-        return np.column_stack([probas, counts])
-    return map_values(val_raw), map_values(test_raw)
-
-# Feature names for target encoding columns (for reference)
-te_col_names = []
-for col in cat_features:
-    for k in range(n_classes):
-        te_col_names.append(f'{col}_proba_{class_names[k]}')
-    te_col_names.append(f'{col}_count')
 
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     fold_start = time.time()
@@ -106,47 +78,20 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     print(f'{"="*60}')
     print(f'  Train size: {len(train_idx)}  |  Val size: {len(val_idx)}')
 
-    # --- Target Encoding (per-fold, leakage-free) ---
-    te_train_list = []
-    te_val_list = []
-    te_test_list = []
-    for col in cat_features:
-        train_raw = train[col].iloc[train_idx].values
-        val_raw = train[col].iloc[val_idx].values
-        test_raw = test[col].values
+    # --- Target Encoding (standard, per-fold) ---
+    te = TargetEncoder()
+    te_train = te.fit_transform(train[cat_features].iloc[train_idx], target_encoded[train_idx])
+    te_val = te.transform(train[cat_features].iloc[val_idx])
+    te_test = te.transform(test[cat_features])
 
-        prior = np.bincount(target_encoded[train_idx], minlength=n_classes) / len(train_idx)
-        categories, inv = np.unique(train_raw, return_inverse=True)
-        n_cats = len(categories)
+    te_train = np.asarray(te_train).astype(np.float64)
+    te_val = np.asarray(te_val).astype(np.float64)
+    te_test = np.asarray(te_test).astype(np.float64)
 
-        cat_probas = np.zeros((n_cats, n_classes))
-        cat_counts = np.zeros(n_cats)
-        for i in range(n_cats):
-            mask = inv == i
-            counts = np.bincount(target_encoded[train_idx][mask], minlength=n_classes)
-            total = counts.sum()
-            cat_counts[i] = total
-            cat_probas[i] = (counts + SMOOTH_M * prior) / (total + SMOOTH_M)
-
-        proba_map = dict(zip(categories, cat_probas))
-        count_map = dict(zip(categories, cat_counts))
-
-        def encode(values):
-            probas = np.array([proba_map.get(v, prior) for v in values])
-            cnt = np.array([count_map.get(v, 0.0) for v in values])
-            return np.column_stack([probas, cnt])
-
-        te_train_list.append(encode(train_raw))
-        te_val_list.append(encode(val_raw))
-        te_test_list.append(encode(test_raw))
-
-    te_train = np.hstack(te_train_list)
-    te_val = np.hstack(te_val_list)
-    te_test = np.hstack(te_test_list)
-
-    X_train_fold = np.hstack([X_base[train_idx], te_train])
-    X_val_fold = np.hstack([X_base[val_idx], te_val])
-    X_test_fold = np.hstack([X_test_base, te_test])
+    cat_codes = lambda df: np.column_stack([df[col].astype('category').cat.codes for col in cat_features]).astype(np.float32)
+    X_train_fold = np.column_stack([X_base.iloc[train_idx][numeric_features].values, cat_codes(X_base.iloc[train_idx]), te_train])
+    X_val_fold = np.column_stack([X_base.iloc[val_idx][numeric_features].values, cat_codes(X_base.iloc[val_idx]), te_val])
+    X_test_fold = np.column_stack([X_test_base[numeric_features].values, cat_codes(X_test_base), te_test])
 
     y_train_fold, y_val_fold = target_encoded[train_idx], target_encoded[val_idx]
     te_time = time.time() - te_start
@@ -170,7 +115,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     oof_catb[val_idx] = catb_val_proba
     catb_val_ba = balanced_accuracy_score(y_val_fold, catb_val_proba.argmax(axis=1))
     catb_scores.append(catb_val_ba)
-    catb_models.append(catb)
     print(f'  CatBoost  | Val BA: {catb_val_ba:.6f} | iter: {catb.get_best_iteration()} | {catb_train_t:.1f}s')
 
     # --- XGBoost ---
@@ -193,7 +137,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     oof_xgb[val_idx] = xgb_val_proba
     xgb_val_ba = balanced_accuracy_score(y_val_fold, xgb_val_proba.argmax(axis=1))
     xgb_scores.append(xgb_val_ba)
-    xgb_models.append(xgb)
     print(f'  XGBoost   | Val BA: {xgb_val_ba:.6f} | iter: {xgb.best_iteration} | {xgb_train_t:.1f}s')
 
     # --- LightGBM ---
@@ -216,7 +159,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     oof_lgb[val_idx] = lgb_val_proba
     lgb_val_ba = balanced_accuracy_score(y_val_fold, lgb_val_proba.argmax(axis=1))
     lgb_scores.append(lgb_val_ba)
-    lgb_models.append(lgb)
     print(f'  LightGBM  | Val BA: {lgb_val_ba:.6f} | iter: {lgb.best_iteration_} | {lgb_train_t:.1f}s')
 
     # --- Test predictions (accumulate) ---
@@ -289,4 +231,3 @@ test_preds = test_blend.argmax(axis=1)
 submission = pd.DataFrame({'id': test_ids, 'health_condition': class_names[test_preds]})
 submission.to_csv('output/submission.csv', index=False)
 print(f'\nDone! output/submission.csv saved.')
-print(f'Target encoding added {te_val.shape[1]} extra features ({len(cat_features)} cats x {n_classes+1})')

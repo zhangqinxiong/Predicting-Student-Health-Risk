@@ -33,3 +33,20 @@ env/
 
 # Kaggle download
 playground-series-s6e7.zip
+
+# Generated output
+output/submission.csv
+
+# PyTorch / Lightning checkpoints
+saved_models/
+lightning_logs/
+*.ckpt
+
+# Logs
+*.log
+
+# Test scripts
+test_*.py
+
+# PyTorch temp files
+.pt_tmp/

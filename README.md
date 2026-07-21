@@ -4,6 +4,8 @@
 
 **Public LB: 0.95044** 🏆 — Multiclass classification predicting student health status (**fit / at-risk / unhealthy**) from lifestyle and physiological indicators.
 
+> ⚠️ **Reproducibility note**: GPU training introduces minor numerical non-determinism even with fixed seeds. LB scores fluctuate ±0.0001–0.0002 between runs. Run 3× and pick the best submission.
+
 ## Problem
 
 | Metric | Value |
@@ -27,12 +29,16 @@ Severe class imbalance — naive majority-class prediction yields 0.333 BA.
 6 categorical (integer codes, models use native categorical handling)
 ```
 
-### 3. Per-Fold Target Encoding — +18 dimensions
-Using `category_encoders.TargetEncoder` (standard smoothed target encoding with α=1.0).
+### 3. Per-Fold Multiclass Target Encoding — +18 dimensions
+Custom smoothed target encoding generating **K columns per categorical feature** (one per class):
 
-For each of 6 categorical features, computes class probabilities per category value:
-- `encoded = (counts × mean + α × prior) / (counts + α)`
+```
+P(Y=k | X=c) = (count_k + α × prior_k) / (total + α)
+```
+
 - 3 classes × 6 = 18 dims
+- Laplace smoothing with α=10
+- Unseen categories fall back to fold prior
 
 Computed **inside each fold** to prevent data leakage.
 
@@ -48,6 +54,8 @@ Joined with base features → **31 total dimensions**.
 
 ### 5. Dirichlet-optimized Ensemble
 2000 Dirichlet random trials on OOF predictions → optimal weighted blend.
+
+> Note: Dirichlet weights vary between runs (~±0.2) due to GPU non-determinism, but ensemble LB stays within ±0.0001.
 
 ### 6. Submission
 Best weights applied to test predictions → argmax → inverse label encoding.
@@ -89,6 +97,10 @@ Total: ~3 min for full 5-fold pipeline
 | + NaN passthrough | 0.94920 | 0.94976 | Worse |
 | Native cat (no TE, 13 feats) | 0.94955 | 0.94977 | Less generalization |
 | Raw cat + TE (31 feats) | 0.94959 | **0.95044** | 🏆 **Best** |
+| + Global seeds (`random`/`np`/`PYTHONHASHSEED`) | 0.94954 | 0.95037 | More reproducible |
+| + Multiclass TE (K per cat) | 0.94956 | 0.95037 | Like-for-like TE replacement |
+| TabNet (1 fold, 80K subset) | 0.87439 | — | Underperforms GBDT |
+| + FT-Transformer | OOM | — | Too large for GPU (11GB) |
 
 ## Insights
 
@@ -98,12 +110,15 @@ Total: ~3 min for full 5-fold pipeline
 4. **Per-fold target encoding** must be computed inside CV to prevent leakage; global TE inflates CV by 0.002-0.003.
 5. **RF imputation hurts** — median fill outperforms both NaN passthrough and RF-based imputation.
 6. **Training speed** improved 5× (213s → 37s per fold) by removing train set predict_proba, adding min_delta early stopping, and using `category_encoders.TargetEncoder`.
+7. **Multiclass TE (K per cat) vs single-column TE**: Results are nearly identical (LB 0.95037 vs 0.95044). The additional per-class probability columns don't add value beyond the single-column smoothed encoding.
+8. **GPU non-determinism**: Even with `random.seed`, `np.random.seed`, and `PYTHONHASHSEED`, tree models on GPU produce slightly different OOF predictions between runs (±0.0001 LB). Run multiple times and pick the best submission.
+9. **Neural networks (TabNet, FT-Transformer)** underperform GBDT on this tabular dataset — TabNet at 0.874 CV vs GBDT ensemble at 0.949+.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `train.py` | Main training script (~230 lines) |
+| `train.py` | Main training script (3-model ensemble, 31 features) |
 | `input/` | Competition data (train.csv, test.csv, sample_submission.csv) |
 | `output/submission.csv` | Generated submission |
 | `.gitignore` | Ignores data files, cache, and training logs |

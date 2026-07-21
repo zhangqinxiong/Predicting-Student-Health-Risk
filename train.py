@@ -1,3 +1,5 @@
+import os
+import random
 import time
 import io
 import contextlib
@@ -5,7 +7,6 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.compose import ColumnTransformer
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
 from catboost import CatBoostClassifier, Pool
@@ -15,9 +16,10 @@ from lightgbm import LGBMClassifier, early_stopping as lgb_early_stopping, log_e
 import warnings
 warnings.filterwarnings('ignore')
 
-from category_encoders import TargetEncoder
-
 RANDOM_STATE = 42
+os.environ['PYTHONHASHSEED'] = str(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
 N_FOLDS = 5
 N_DIRICHLET = 2000
 
@@ -36,8 +38,7 @@ numeric_features = [
     'step_count', 'exercise_duration', 'water_intake'
 ]
 
-onehot_features = ['stress_level', 'sleep_quality', 'physical_activity_level', 'diet_type', 'smoking_alcohol', 'gender']
-cat_features = onehot_features
+cat_features = ['stress_level', 'sleep_quality', 'physical_activity_level', 'diet_type', 'smoking_alcohol', 'gender']
 
 for df in [train, test]:
     for col in numeric_features:
@@ -45,20 +46,12 @@ for df in [train, test]:
     for col in cat_features:
         df[col] = df[col].fillna('missing')
 
-for df in [train, test]:
-    for col in numeric_features:
-        df[col] = df[col].fillna(df[col].median())
-    for col in cat_features:
-        df[col] = df[col].fillna('missing')
-
-cat_features_idx = list(range(7, 13))
 all_features = numeric_features + cat_features
 X_base = train[all_features].copy()
 X_test_base = test[all_features].copy()
 
 skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-# Store OOF probs for each model
 oof_catb = np.zeros((len(train), 3))
 oof_xgb = np.zeros((len(train), 3))
 oof_lgb = np.zeros((len(train), 3))
@@ -78,17 +71,29 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_base, target_encoded)):
     print(f'{"="*60}')
     print(f'  Train size: {len(train_idx)}  |  Val size: {len(val_idx)}')
 
-    # --- Target Encoding (standard, per-fold) ---
-    te = TargetEncoder()
-    te_train = te.fit_transform(train[cat_features].iloc[train_idx], target_encoded[train_idx])
-    te_val = te.transform(train[cat_features].iloc[val_idx])
-    te_test = te.transform(test[cat_features])
-
-    te_train = np.asarray(te_train).astype(np.float64)
-    te_val = np.asarray(te_val).astype(np.float64)
-    te_test = np.asarray(te_test).astype(np.float64)
-
+    # --- Multiclass Target Encoding (K=3 columns per cat feature) ---
+    SMOOTH_M = 10.0
     cat_codes = lambda df: np.column_stack([df[col].astype('category').cat.codes for col in cat_features]).astype(np.float32)
+
+    te_train_list, te_val_list, te_test_list = [], [], []
+    for col in cat_features:
+        train_raw = train[col].iloc[train_idx].values
+        prior = np.bincount(target_encoded[train_idx], minlength=n_classes) / len(train_idx)
+        categories, inv = np.unique(train_raw, return_inverse=True)
+        cat_probas = np.zeros((len(categories), n_classes))
+        for i in range(len(categories)):
+            counts = np.bincount(target_encoded[train_idx][inv == i], minlength=n_classes)
+            cat_probas[i] = (counts + SMOOTH_M * prior) / (counts.sum() + SMOOTH_M)
+        proba_map = dict(zip(categories, cat_probas))
+        encode = lambda vals: np.array([proba_map.get(v, prior) for v in vals])
+        te_train_list.append(encode(train_raw))
+        te_val_list.append(encode(train[col].iloc[val_idx].values))
+        te_test_list.append(encode(test[col].values))
+
+    te_train = np.hstack(te_train_list)
+    te_val = np.hstack(te_val_list)
+    te_test = np.hstack(te_test_list)
+
     X_train_fold = np.column_stack([X_base.iloc[train_idx][numeric_features].values, cat_codes(X_base.iloc[train_idx]), te_train])
     X_val_fold = np.column_stack([X_base.iloc[val_idx][numeric_features].values, cat_codes(X_base.iloc[val_idx]), te_val])
     X_test_fold = np.column_stack([X_test_base[numeric_features].values, cat_codes(X_test_base), te_test])
@@ -183,7 +188,6 @@ print(f'CatBoost CV: {np.mean(catb_scores):.6f} +/- {np.std(catb_scores):.6f}')
 print(f'XGBoost  CV: {np.mean(xgb_scores):.6f} +/- {np.std(xgb_scores):.6f}')
 print(f'LightGBM CV: {np.mean(lgb_scores):.6f} +/- {np.std(lgb_scores):.6f}')
 
-# --- Dirichlet weight search ---
 print(f'\n{"="*60}')
 print('Dirichlet weight search...')
 rng = np.random.default_rng(RANDOM_STATE)
